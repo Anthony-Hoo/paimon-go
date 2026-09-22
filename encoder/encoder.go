@@ -23,9 +23,10 @@ import (
 	"encoding/json"
 	"io"
 	"reflect"
-	"strconv"
 
+	"github.com/bytedance/sonic/decoder"
 	"github.com/bytedance/sonic/internal/backend"
+	nativetypes "github.com/bytedance/sonic/internal/native/types"
 	"github.com/bytedance/sonic/internal/stdjsoncompat"
 	"github.com/bytedance/sonic/option"
 )
@@ -124,12 +125,7 @@ func EncodeInto(buf *[]byte, val interface{}, opts Options) error {
 	if buf == nil {
 		panic("user-supplied buffer buf is nil")
 	}
-	out, err := Encode(val, opts)
-	if err != nil {
-		return err
-	}
-	*buf = append(*buf, out...)
-	return nil
+	return stdjsoncompat.Append(buf, val, optionToConfig(opts))
 }
 
 // HTMLEscape appends to dst the JSON-escaped form of src, replacing <,
@@ -143,22 +139,57 @@ func HTMLEscape(dst []byte, src []byte) []byte {
 }
 
 // Quote returns a double-quoted JSON string literal form of s. It is a
-// thin wrapper over strconv.Quote; callers that need HTML-escaped
-// output should compose HTMLEscape on top.
+// UTF-8 bytes are retained, and control characters use JSON escapes.
 func Quote(s string) string {
-	return strconv.Quote(s)
+	return quoteJSON(s)
 }
 
-// Valid reports whether data is a single well-formed JSON value. It
-// also returns the offset of the first non-whitespace byte so callers
-// can locate the start of the JSON value. When the data is invalid but
-// contains only whitespace (or is empty), start is len(data).
+// Valid checks Sonic's structural JSON grammar and returns the first value's
+// start on success, or the offending cursor on failure. Like native Sonic,
+// string escape contents and UTF-8 are not validated by this entry point.
 func Valid(data []byte) (ok bool, start int) {
-	start = firstNonSpaceOffset(data)
-	if !json.Valid(data) {
-		return false, start
+	if len(data) == 0 {
+		return false, -1
+	}
+	start, end := decoder.Skip(data)
+	if start < 0 {
+		// Native ValidateOne points at the mismatching literal byte, while
+		// SkipOne exposes the cursor just before that byte is consumed.
+		if start == -int(nativetypes.ERR_INVALID_CHAR) && literalMismatch(data, end) {
+			return false, end
+		}
+		return false, end - 1
+	}
+	for i := end; i < len(data); i++ {
+		switch data[i] {
+		case ' ', '\t', '\n', '\r':
+		default:
+			return false, i
+		}
 	}
 	return true, start
+}
+
+func literalMismatch(data []byte, at int) bool {
+	if at < 1 || at >= len(data) {
+		return false
+	}
+	for _, literal := range [...]string{"true", "false", "null"} {
+		for n := 1; n < len(literal) && n <= at; n++ {
+			start := at - n
+			if string(data[start:at]) != literal[:n] || data[at] == literal[n] {
+				continue
+			}
+			if start == 0 {
+				return true
+			}
+			switch data[start-1] {
+			case ' ', '\t', '\n', '\r', '[', ',', ':':
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // firstNonSpaceOffset returns the index of the first byte in data that
@@ -205,8 +236,8 @@ type Encoder struct {
 }
 
 // Encode marshals v under the encoder's current configuration. When prefix
-// or indent is non-empty the output is indented and terminated with a newline;
-// otherwise it is compact.
+// or indent is non-empty the output is indented. Encoder.Encode never adds a
+// trailing newline; StreamEncoder controls record separators separately.
 func (e *Encoder) Encode(v interface{}) ([]byte, error) {
 	if e.prefix == "" && e.indent == "" {
 		return Encode(v, e.Opts)
@@ -215,7 +246,7 @@ func (e *Encoder) Encode(v interface{}) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return append(out, '\n'), nil
+	return out, nil
 }
 
 // SetCompactMarshaler toggles the CompactMarshaler option bit.
@@ -243,7 +274,8 @@ func (e *Encoder) SetIndent(prefix, indent string) {
 	e.indent = indent
 }
 
-// SetNoEncoderNewline toggles the NoEncoderNewline option bit. Encoder.Encode emits a trailing newline only for indented output; StreamEncoder applies the option to suppress its final newline.
+// SetNoEncoderNewline toggles the StreamEncoder record separator. It has no
+// effect on Encoder.Encode, which never appends a newline.
 func (e *Encoder) SetNoEncoderNewline(on bool) {
 	if on {
 		e.Opts |= NoEncoderNewline
@@ -295,7 +327,9 @@ type StreamEncoder struct {
 	Encoder
 	// w is the destination writer. It is set at construction time and
 	// is not replaced.
-	w io.Writer
+	w        io.Writer
+	stream   backend.StreamEncoder
+	lastOpts Options
 }
 
 // NewStreamEncoder constructs a StreamEncoder writing to w. The
@@ -315,36 +349,13 @@ func NewStreamEncoder(w io.Writer) *StreamEncoder {
 // Opts, matching the default behavior of encoding/json's
 // json.Encoder.Encode and Sonic's encoder.StreamEncoder.
 func (e *StreamEncoder) Encode(val interface{}) error {
-	out, err := e.Encoder.Encode(val)
-	if err != nil {
-		return err
+	if e.stream == nil || e.lastOpts != e.Opts {
+		e.stream = stdjsoncompat.NewEncoder(e.w, optionToConfig(e.Opts))
+		e.lastOpts = e.Opts
 	}
-	if e.Opts&NoEncoderNewline != 0 && len(out) > 0 && out[len(out)-1] == '\n' {
-		out = out[:len(out)-1]
-	}
-	for offset := 0; offset < len(out); {
-		n, err := e.w.Write(out[offset:])
-		if err != nil {
-			return err
-		}
-		if n <= 0 || n > len(out)-offset {
-			return io.ErrShortWrite
-		}
-		offset += n
-	}
-	if e.Opts&NoEncoderNewline == 0 && (len(out) == 0 || out[len(out)-1] != '\n') {
-		for offset := 0; offset < len(newlineBytes); {
-			n, err := e.w.Write(newlineBytes[offset:])
-			if err != nil {
-				return err
-			}
-			if n <= 0 || n > len(newlineBytes)-offset {
-				return io.ErrShortWrite
-			}
-			offset += n
-		}
-	}
-	return nil
+	e.stream.SetEscapeHTML(e.Opts&EscapeHTML != 0)
+	e.stream.SetIndent(e.prefix, e.indent)
+	return e.stream.Encode(val)
 }
 
 // newlineBytes is the single-byte newline appended by StreamEncoder

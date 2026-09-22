@@ -7,11 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -112,10 +114,50 @@ func buildHelperExecutables(paths helperExecutablePaths) error {
 	} {
 		cmd := exec.Command("go", "build", "-mod=readonly", "-o", helper.output, helper.packagePath)
 		cmd.Dir = helper.dir
+		if helper.name == "upstream" {
+			toolchain := os.Getenv("SONIC_DIFFTEST_UPSTREAM_TOOLCHAIN")
+			if toolchain == "" {
+				toolchain = "go1.26.7"
+			}
+			cmd.Env = helperEnvironment(toolchain)
+		}
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("build %s helper: %w\n%s", helper.name, err, output)
 		}
+		if err := verifyNativeHelper(helper.output); err != nil {
+			return fmt.Errorf("verify %s helper: %w", helper.name, err)
+		}
+	}
+	return nil
+}
+
+func helperEnvironment(toolchain string) []string {
+	env := make([]string, 0, len(os.Environ())+2)
+	for _, item := range os.Environ() {
+		if !strings.HasPrefix(item, "GOTOOLCHAIN=") && !strings.HasPrefix(item, "GOEXPERIMENT=") {
+			env = append(env, item)
+		}
+	}
+	return append(env, "GOTOOLCHAIN="+toolchain, "GOEXPERIMENT=")
+}
+
+func verifyNativeHelper(path string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), helperTimeout)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, path, "--info").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("read helper identity: %w: %s", err, output)
+	}
+	var info struct {
+		GoVersion string `json:"go_version"`
+		APIKind   int    `json:"api_kind"`
+	}
+	if err := json.Unmarshal(output, &info); err != nil {
+		return err
+	}
+	if info.APIKind != 1 || info.GoVersion == "" {
+		return fmt.Errorf("expected native Sonic (APIKind=1), got %s", output)
 	}
 	return nil
 }
@@ -235,6 +277,9 @@ func runHelper(t *testing.T, dir string, req request) result {
 	if err := json.Unmarshal(stdout, &res); err != nil {
 		t.Fatalf("unmarshal helper %s stdout: %v\nstdout:\n%s\nstderr:\n%s", dir, err, string(stdout), stderr)
 	}
+	if res.MarshalOK && !json.Valid([]byte(res.Normalized)) {
+		t.Fatalf("helper %s produced invalid JSON: %q", dir, res.Normalized)
+	}
 	return res
 }
 
@@ -255,16 +300,16 @@ func newHelperContext(t *testing.T) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(t.Context(), helperTimeout)
 }
 
-func assertRawControlDifference(t *testing.T, data string, local, upstream result) {
+func assertRawControlParity(t *testing.T, data string, local, upstream result) {
 	t.Helper()
-	if err := rawControlDifferenceError(t, data, local, upstream); err != nil {
+	if err := rawControlParityError(t, data, local, upstream); err != nil {
 		t.Fatal(err)
 	}
 }
 
-// rawControlDifferenceError is kept separate from the testing wrapper so the
+// rawControlParityError is kept separate from the testing wrapper so the
 // raw oracle can be regression-tested against shared corruption.
-func rawControlDifferenceError(t *testing.T, data string, local, upstream result) error {
+func rawControlParityError(t *testing.T, data string, local, upstream result) error {
 	wantNormalized := canonicalRawControlNormalization(t, data)
 	wantRaw, err := independentRawControlRoot(data)
 	if err != nil {
@@ -273,8 +318,8 @@ func rawControlDifferenceError(t *testing.T, data string, local, upstream result
 	if !local.Valid || !local.UnmarshalOK || !local.MarshalOK || local.Normalized != wantNormalized {
 		return fmt.Errorf("local raw-control result = %+v, want accepted and normalized to %q", local, wantNormalized)
 	}
-	if upstream.Valid || upstream.UnmarshalOK || upstream.MarshalOK || upstream.Normalized != "" {
-		return fmt.Errorf("upstream raw-control result = %+v, want rejected with empty normalization", upstream)
+	if !upstream.Valid || !upstream.UnmarshalOK || !upstream.MarshalOK || upstream.Normalized != wantNormalized {
+		return fmt.Errorf("upstream raw-control result = %+v, want accepted and normalized to %q", upstream, wantNormalized)
 	}
 	for _, operation := range []struct {
 		name        string
@@ -294,8 +339,9 @@ func rawControlDifferenceError(t *testing.T, data string, local, upstream result
 			return fmt.Errorf("%s raw = local %q, upstream %q; want independent raw %q", operation.name, operation.localRaw, operation.upstreamRaw, wantRaw)
 		}
 	}
-	if local.PreorderOnlyNumber != upstream.PreorderOnlyNumber || local.PreorderOnlyNumber != `["error"]` {
-		return fmt.Errorf("Preorder only number = local %q upstream %q, want both %q", local.PreorderOnlyNumber, upstream.PreorderOnlyNumber, `["error"]`)
+	wantNumbers := canonicalPreorderNumbers(t, data)
+	if local.PreorderOnlyNumber != wantNumbers || upstream.PreorderOnlyNumber != wantNumbers {
+		return fmt.Errorf("Preorder only number = local %q upstream %q, want both %q", local.PreorderOnlyNumber, upstream.PreorderOnlyNumber, wantNumbers)
 	}
 	if local.NewRawType != upstream.NewRawType {
 		return fmt.Errorf("NewRawType mismatch: local %d, upstream %d", local.NewRawType, upstream.NewRawType)
@@ -411,6 +457,32 @@ func firstJSONValueOffset(data []byte) int {
 	return len(data)
 }
 
+// Derive the numeric callback trace using an independent standard decoder.
+// Do not hide raw-control Preorder results behind a synthetic error marker.
+func canonicalPreorderNumbers(t *testing.T, data string) string {
+	t.Helper()
+	d := json.NewDecoder(strings.NewReader(escapeRawControlsInStringTokens(data)))
+	d.UseNumber()
+	var events []string
+	for {
+		token, err := d.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n, ok := token.(json.Number); ok {
+			events = append(events, "float64:0:"+string(n))
+		}
+	}
+	out, err := json.Marshal(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out)
+}
+
 func canonicalRawControlNormalization(t *testing.T, data string) string {
 	t.Helper()
 	var value interface{}
@@ -464,8 +536,8 @@ func escapeRawControlsInStringTokens(data string) string {
 	return string(normalized)
 }
 
-// hasRawControlInStringToken identifies the documented local-only acceptance
-// of unescaped ASCII control bytes in otherwise valid JSON string tokens.
+// hasRawControlInStringToken selects raw-control cases for an independent
+// normalization oracle in addition to the native Sonic comparison.
 func hasRawControlInStringToken(data string) bool {
 	normalized := make([]byte, 0, len(data))
 	inString := false
@@ -525,6 +597,8 @@ func FuzzUpstreamSonicParity(f *testing.F) {
 		`{"a":1e}`,
 		`{"a":+1}`,
 		`7xxx`,
+		`"\u2028"`,
+		`"\u2029"`,
 	} {
 		f.Add(seed)
 	}
@@ -545,7 +619,7 @@ func FuzzUpstreamSonicParity(f *testing.F) {
 		local := runHelper(t, filepath.Join("local"), req)
 		upstream := runHelper(t, filepath.Join("upstream"), req)
 		if isRawControl {
-			assertRawControlDifference(t, data, local, upstream)
+			assertRawControlParity(t, data, local, upstream)
 			return
 		}
 		if !reflect.DeepEqual(local, upstream) {
@@ -554,13 +628,13 @@ func FuzzUpstreamSonicParity(f *testing.F) {
 	})
 }
 
-func TestRawControlDifference(t *testing.T) {
+func TestRawControlParity(t *testing.T) {
 	data := string([]byte{'{', '"', 0x11, 'x', '"', ':', '1', '}'})
 	req := request{Data: base64.StdEncoding.EncodeToString([]byte(data))}
 	local := runHelper(t, filepath.Join("local"), req)
 	upstream := runHelper(t, filepath.Join("upstream"), req)
 
-	assertRawControlDifference(t, data, local, upstream)
+	assertRawControlParity(t, data, local, upstream)
 	if local.Normalized != `{"\u0011x":1}` {
 		t.Fatalf("local normalization = %q, want %q", local.Normalized, `{"\u0011x":1}`)
 	}
@@ -580,7 +654,7 @@ func TestRawControlDifference(t *testing.T) {
 	}
 }
 
-func TestRawControlDifferenceRejectsSharedCorruption(t *testing.T) {
+func TestRawControlParityRejectsSharedCorruption(t *testing.T) {
 	data := string([]byte{'{', '"', 0x11, 'x', '"', ':', '1', '}'})
 	corrupted := `{"\u0011x":1}`
 	wantNormalized := canonicalRawControlNormalization(t, data)
@@ -595,21 +669,17 @@ func TestRawControlDifferenceRejectsSharedCorruption(t *testing.T) {
 		GetPathRaw:         corrupted,
 		SearcherPathOK:     true,
 		SearcherPathRaw:    corrupted,
-		PreorderOnlyNumber: `["error"]`,
+		PreorderOnlyNumber: canonicalPreorderNumbers(t, data),
 		NewRawType:         6,
 	}
 	upstream := local
-	upstream.Valid = false
-	upstream.UnmarshalOK = false
-	upstream.MarshalOK = false
-	upstream.Normalized = ""
 
-	if err := rawControlDifferenceError(t, data, local, upstream); err == nil {
+	if err := rawControlParityError(t, data, local, upstream); err == nil {
 		t.Fatal("raw-control validator accepted identical corrupted raw values")
 	}
 }
 
-func TestRawControlDifferenceGeneralizes(t *testing.T) {
+func TestRawControlParityGeneralizes(t *testing.T) {
 	for _, tt := range []struct {
 		name           string
 		data           string
@@ -654,7 +724,7 @@ func TestRawControlDifferenceGeneralizes(t *testing.T) {
 			local := runHelper(t, filepath.Join("local"), req)
 			upstream := runHelper(t, filepath.Join("upstream"), req)
 
-			assertRawControlDifference(t, tt.data, local, upstream)
+			assertRawControlParity(t, tt.data, local, upstream)
 			if local.Normalized != tt.wantNormalized {
 				t.Fatalf("local normalization = %q, want %q", local.Normalized, tt.wantNormalized)
 			}
@@ -682,16 +752,17 @@ func TestHelperContextDeadline(t *testing.T) {
 	before := time.Now()
 	ctx, cancel := newHelperContext(t)
 	defer cancel()
+	after := time.Now()
 
 	deadline, ok := ctx.Deadline()
 	if !ok {
 		t.Fatal("helper context has no deadline")
 	}
 	remaining := time.Until(deadline)
-	if remaining > helperTimeout || deadline.After(before.Add(helperTimeout)) {
+	if remaining > helperTimeout || deadline.After(after.Add(helperTimeout)) {
 		t.Fatalf("helper context deadline exceeds timeout: remaining=%s timeout=%s", remaining, helperTimeout)
 	}
-	if remaining < helperTimeout-time.Second {
+	if deadline.Before(before.Add(helperTimeout - time.Second)) {
 		t.Fatalf("helper context deadline is not close to timeout: remaining=%s timeout=%s", remaining, helperTimeout)
 	}
 }
@@ -887,8 +958,8 @@ func TestFinalReviewSonicParity(t *testing.T) {
 		rootValue string
 		pathValue string
 	}{
-		{name: "root bare exponent followed by space", data: "1e ", rootValue: "1e", pathValue: "1e"},
-		{name: "root bare exponent followed by comma", data: "1e,", rootValue: "1e", pathValue: "1e"},
+		{name: "root bare exponent followed by space", data: "1e "},
+		{name: "root bare exponent followed by comma", data: "1e,"},
 		{name: "matched b before malformed sibling", data: `{"b":2,"a":{`, path: []pathPart{{Kind: "key", Key: "b"}}, pathValue: "2"},
 		{name: "matched a before malformed sibling", data: `{"a":1,"b":}`, path: []pathPart{{Kind: "key", Key: "a"}}, pathValue: "1"},
 		{name: "selected malformed value remains rejected", data: `{"a":{`, path: []pathPart{{Kind: "key", Key: "a"}}},

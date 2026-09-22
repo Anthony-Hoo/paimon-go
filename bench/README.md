@@ -205,3 +205,7 @@ finally {
 - local 与 upstream 使用不同 Go 版本，结果同时包含实现和工具链差异。
 - 笔记本电源策略、温度、后台负载和 Go patch 版本都会影响结果。
 - 发布级性能判断应增加运行次数、固定 CPU 条件，并使用 `benchstat` 进行统计分析。
+
+## 扩展 workload 与同工具链优化结果
+
+`rootbench/workloads_bench_test.go` 额外覆盖大容器 Searcher、字符串查询与拷贝、连续 decoder、流式 encoder、EncodeInto、数字模式和深嵌套 Preorder。2026-09-22 的同工具链前后结果及原始日志见 [docs/performance.md](../docs/performance.md)。这组比较与上面的 upstream 跨工具链比较分开报告。
