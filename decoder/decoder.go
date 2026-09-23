@@ -616,15 +616,6 @@ func (d *Decoder) Decode(val interface{}) error {
 
 func (d *Decoder) invalidateDecoder() { d.dec = nil }
 
-// byteForIndex returns the byte at index i in s. It is a helper so the
-// whitespace-skip loop can stay allocation-free.
-func byteForIndex(s string, i int) byte {
-	if i < len(s) {
-		return s[i]
-	}
-	return 0
-}
-
 // CheckTrailings returns nil if only whitespace bytes remain in the
 // source string after the current position. It returns an error
 // otherwise, matching Sonic's behavior of rejecting trailing non-JSON

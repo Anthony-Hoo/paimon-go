@@ -546,10 +546,6 @@ func isJSONSpace(c byte) bool {
 	return c == ' ' || c == '\n' || c == '\r' || c == '\t'
 }
 
-func isJSONNumberTerminator(c byte) bool {
-	return isJSONSpace(c) || c == ',' || c == ']' || c == '}'
-}
-
 // Loads parses src as a single JSON value and returns it as an
 // interface{}. Numbers are returned as float64. The first return value
 // is the byte offset where the parsed value ended.

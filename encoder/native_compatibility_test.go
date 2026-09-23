@@ -3,7 +3,11 @@ package encoder
 import (
 	"encoding/json"
 	"io"
+	"strings"
 	"testing"
+
+	"github.com/bytedance/sonic/decoder"
+	nativetypes "github.com/bytedance/sonic/internal/native/types"
 )
 
 func TestNativeQuoteControls(t *testing.T) {
@@ -27,13 +31,38 @@ func TestNativeValidationPositions(t *testing.T) {
 		pos   int
 	}{
 		{"", false, -1}, {" \n ", false, 3}, {`{"a":}`, false, 5}, {`[1,]`, false, 3},
-		{`true false`, false, 5}, {`trX`, false, 2}, {`[falX]`, false, 4}, {`1e+`, false, 1},
+		{`true false`, false, 5}, {`trX`, false, 2}, {`[falX]`, false, 3}, {`1e+`, false, 1},
+		{`truX`, false, 2}, {`nan`, false, 2}, {`1..2`, false, 1},
+		{`{"a"}`, false, 4},
+		{strings.Repeat("[", 4096) + "1..2" + strings.Repeat("]", 4096), false, 4097},
 		{`"\q"`, true, 0}, {`"\uZZZZ"`, true, 0}, {"\"x\ny\"", true, 0},
 	}
 	for _, tt := range cases {
 		if ok, pos := Valid([]byte(tt.src)); ok != tt.valid || pos != tt.pos {
 			t.Fatalf("Valid(%q)=%v,%d; want %v,%d", tt.src, ok, pos, tt.valid, tt.pos)
 		}
+	}
+}
+
+func TestNativeValidationDepthErrorPositions(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		src  string
+		pos  int
+	}{
+		{"array at limit with nested array", strings.Repeat("[", 4096) + "[]" + strings.Repeat("]", 4096), 4096},
+		{"object at limit with scalar", strings.Repeat(`{"a":`, 4096) + "0" + strings.Repeat("}", 4096), 20478},
+		{"object at limit with malformed number", strings.Repeat(`{"a":`, 4096) + "1..2" + strings.Repeat("}", 4096), 20478},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			code, cursor := decoder.Skip([]byte(tt.src))
+			if code != -int(nativetypes.ERR_RECURSE_EXCEED_MAX) || cursor-1 != tt.pos {
+				t.Fatalf("Skip code=%d cursor=%d; want recursion error and cursor=%d", code, cursor, tt.pos+1)
+			}
+			if ok, pos := Valid([]byte(tt.src)); ok || pos != tt.pos {
+				t.Fatalf("Valid=(%t,%d); want (false,%d)", ok, pos, tt.pos)
+			}
+		})
 	}
 }
 

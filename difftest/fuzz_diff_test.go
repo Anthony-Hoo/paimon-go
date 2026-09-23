@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -205,6 +206,8 @@ type request struct {
 
 type result struct {
 	Valid              bool   `json:"valid"`
+	EncoderValid       bool   `json:"encoder_valid"`
+	EncoderValidStart  int    `json:"encoder_valid_start"`
 	UnmarshalOK        bool   `json:"unmarshal_ok"`
 	MarshalOK          bool   `json:"marshal_ok"`
 	Normalized         string `json:"normalized,omitempty"`
@@ -310,6 +313,9 @@ func assertRawControlParity(t *testing.T, data string, local, upstream result) {
 // rawControlParityError is kept separate from the testing wrapper so the
 // raw oracle can be regression-tested against shared corruption.
 func rawControlParityError(t *testing.T, data string, local, upstream result) error {
+	if local.EncoderValid != upstream.EncoderValid || local.EncoderValidStart != upstream.EncoderValidStart {
+		return fmt.Errorf("encoder.Valid(%q) = local (%t,%d), upstream (%t,%d)", data, local.EncoderValid, local.EncoderValidStart, upstream.EncoderValid, upstream.EncoderValidStart)
+	}
 	wantNormalized := canonicalRawControlNormalization(t, data)
 	wantRaw, err := independentRawControlRoot(data)
 	if err != nil {
@@ -597,6 +603,11 @@ func FuzzUpstreamSonicParity(f *testing.F) {
 		`{"a":1e}`,
 		`{"a":+1}`,
 		`7xxx`,
+		`truX`,
+		`nan`,
+		`1..2`,
+		`[truX]`,
+		`{"a":1..2}`,
 		`"\u2028"`,
 		`"\u2029"`,
 	} {
@@ -626,6 +637,122 @@ func FuzzUpstreamSonicParity(f *testing.F) {
 			t.Fatalf("sonic parity mismatch\ndata: %q\npath: %+v\nlocal: %+v\nupstream: %+v", data, req.Path, local, upstream)
 		}
 	})
+}
+
+func TestEncoderValidCursorParity(t *testing.T) {
+	ctx, cancel := newHelperContext(t)
+	defer cancel()
+	info, stderr, _, err := runHelperProcess(ctx, helperExecutables.upstream, nil, "--info")
+	if err != nil {
+		t.Fatalf("upstream helper identity: %v: %s", err, stderr)
+	}
+	var native struct {
+		GoVersion string `json:"go_version"`
+		APIKind   int    `json:"api_kind"`
+	}
+	if err := json.Unmarshal(info, &native); err != nil || native.GoVersion != "go1.26.7" || native.APIKind != 1 {
+		t.Fatalf("expected native Sonic on Go 1.26.7 (APIKind=1), got %s: %v", info, err)
+	}
+	for _, data := range []string{
+		"", " ", "\n  ", "true", " false ", "  null \t", "0", "-123.45e+6", "[]", "{}", " [true] ",
+		"truX", "trX", "falX", "nulX", "nan", "fax", "t", "tru", "n", "nul", "falsee",
+		"1..2", "1.x", "1.", "1e", "1e+", "1e+x", "-", "-x", "01", "1x", "1 2", "true false",
+		"[truX]", "[falX]", "[nan]", "[1..2]", "[1e+]", "[1,]", "[1 x]", "[x]", "[true, false,]",
+		`{"a":}`, `{"a":truX}`, `{"a":nan}`, `{"a":1..2}`, `{"a":1e+}`, `{"a" 1}`, `{"a":1,}`, `{"a":1 x}`,
+		" \n [\ttruX]", " [0, {\"x\": 1..2}]", "\x00", "[\x00]", "\"unterminated", "{", "[",
+		"tXxx", "txxx", "trux", "trueX", "naxx", "nulx", "fXxxx", "faXxx", "falXx", "falseX",
+		"tX", "tx", "nx", "fx", "fa", "fal", "fals", "nux", "nullx", "\t nan ", "\t fax ",
+		"1.x2", "1.2.3", "1e+x", "1e-x", "1e1.2", "1e1e2", "1e1+2", "1e2-3", "1.2e+3.4", "1.2e-", "1e-", "1e- ",
+		"-.", "-1..2", "-1.2.3", "-1e+", "-1e+x", "1e+e", "1e++", "1e+1e", "1e+1+", "1.e1", "1. e", "12.3.4", "12e2e", "12e+e",
+		"[ 1..2 ]", "[ -1..2 ]", "{\"x\": 1e+2.3}", "[1,2..3]", "{\"x\": \t nux}",
+		"4E8.9918E915..37", "88e14877E206.+9E35e+057506E1++.9-474e-..+76-82-+8E+28.e21",
+		`{"x":[0,268121.2+E+29.+.]}`,
+	} {
+		req := request{Data: base64.StdEncoding.EncodeToString([]byte(data))}
+		local := runHelper(t, "local", req)
+		upstream := runHelper(t, "upstream", req)
+		if local.EncoderValid != upstream.EncoderValid || local.EncoderValidStart != upstream.EncoderValidStart {
+			t.Errorf("encoder.Valid(%q) = local (%t,%d), upstream (%t,%d)", data, local.EncoderValid, local.EncoderValidStart, upstream.EncoderValid, upstream.EncoderValidStart)
+		}
+	}
+}
+
+func TestEncoderValidReviewRegression(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		data string
+		want int
+	}{
+		{name: "missing object colon", data: `{"a"}`},
+		{name: "nesting 4095", data: strings.Repeat("[", 4095) + "1..2" + strings.Repeat("]", 4095)},
+		{name: "nesting 4096", data: strings.Repeat("[", 4096) + "1..2" + strings.Repeat("]", 4096)},
+		{name: "nesting 4097", data: strings.Repeat("[", 4097) + "1..2" + strings.Repeat("]", 4097)},
+		{name: "array depth limit nested array", data: strings.Repeat("[", 4096) + "[]" + strings.Repeat("]", 4096), want: 4096},
+		{name: "object depth limit scalar", data: strings.Repeat(`{"a":`, 4096) + "0" + strings.Repeat("}", 4096), want: 20478},
+		{name: "object depth limit invalid number", data: strings.Repeat(`{"a":`, 4096) + "1..2" + strings.Repeat("}", 4096), want: 20478},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			req := request{Data: base64.StdEncoding.EncodeToString([]byte(tt.data))}
+			local := runHelper(t, "local", req)
+			upstream := runHelper(t, "upstream", req)
+			if local.EncoderValid != upstream.EncoderValid || local.EncoderValidStart != upstream.EncoderValidStart {
+				t.Errorf("encoder.Valid(%s, bytes=%d) local=(%t,%d) upstream=(%t,%d)", tt.name, len(tt.data), local.EncoderValid, local.EncoderValidStart, upstream.EncoderValid, upstream.EncoderValidStart)
+			}
+			if tt.want != 0 && (upstream.EncoderValid || upstream.EncoderValidStart != tt.want) {
+				t.Errorf("native encoder.Valid(%s) = (%t,%d), want (false,%d)", tt.name, upstream.EncoderValid, upstream.EncoderValidStart, tt.want)
+			}
+		})
+	}
+	data := "1ee" + strings.Repeat("1", 13) + ".." + strings.Repeat("1", 14)
+	for _, tt := range []struct {
+		mode string
+		want int
+	}{{"auto", 16}, {"noavx", 1}, {"noavx2", 1}} {
+		t.Run(tt.mode, func(t *testing.T) {
+			t.Setenv("SONIC_MODE", tt.mode)
+			req := request{Data: base64.StdEncoding.EncodeToString([]byte(data))}
+			local := runHelper(t, "local", req)
+			upstream := runHelper(t, "upstream", req)
+			if local.EncoderValid != upstream.EncoderValid || local.EncoderValidStart != upstream.EncoderValidStart {
+				t.Errorf("SONIC_MODE=%s encoder.Valid(%q) local=(%t,%d) upstream=(%t,%d)", tt.mode, data, local.EncoderValid, local.EncoderValidStart, upstream.EncoderValid, upstream.EncoderValidStart)
+			}
+			if upstream.EncoderValid || upstream.EncoderValidStart != tt.want {
+				t.Errorf("SONIC_MODE=%s native encoder.Valid=(%t,%d), want (false,%d)", tt.mode, upstream.EncoderValid, upstream.EncoderValidStart, tt.want)
+			}
+		})
+	}
+}
+
+func TestEncoderValidRandomCursorParity(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	const alphabet = "0123456789-.eE+tnrufals[]{}:, \t\r\n\"\\\x00\xff"
+	const numberAlphabet = "0123456789.eE+-"
+	for i := 0; i < 510; i++ {
+		chars := alphabet
+		size := rng.Intn(40) + 1
+		if i%3 != 0 {
+			chars = numberAlphabet
+			size = rng.Intn(15) + 2
+		}
+		if i >= 450 {
+			chars = numberAlphabet
+			size = rng.Intn(48) + 32
+		}
+		data := make([]byte, size)
+		for j := range data {
+			data[j] = chars[rng.Intn(len(chars))]
+		}
+		if i%3 == 2 {
+			data = append([]byte(`{"x":[0,`), data...)
+			data = append(data, ']', '}')
+		}
+		req := request{Data: base64.StdEncoding.EncodeToString(data)}
+		local := runHelper(t, "local", req)
+		upstream := runHelper(t, "upstream", req)
+		if local.EncoderValid != upstream.EncoderValid || local.EncoderValidStart != upstream.EncoderValidStart {
+			t.Errorf("encoder.Valid(%q) = local (%t,%d), upstream (%t,%d)", data, local.EncoderValid, local.EncoderValidStart, upstream.EncoderValid, upstream.EncoderValidStart)
+		}
+	}
 }
 
 func TestRawControlParity(t *testing.T) {

@@ -13,6 +13,7 @@ import (
 
 	"github.com/bytedance/sonic"
 	"github.com/bytedance/sonic/ast"
+	"github.com/bytedance/sonic/encoder"
 )
 
 const maxRequestBytes = 1 << 20
@@ -32,6 +33,8 @@ type request struct {
 
 type result struct {
 	Valid              bool   `json:"valid"`
+	EncoderValid       bool   `json:"encoder_valid"`
+	EncoderValidStart  int    `json:"encoder_valid_start"`
 	UnmarshalOK        bool   `json:"unmarshal_ok"`
 	MarshalOK          bool   `json:"marshal_ok"`
 	Normalized         string `json:"normalized,omitempty"`
@@ -70,7 +73,8 @@ func run() result {
 		return result{}
 	}
 
-	res := result{Valid: sonic.Valid(data)}
+	ok, start := encoder.Valid(data)
+	res := result{Valid: sonic.Valid(data), EncoderValid: ok, EncoderValidStart: start}
 
 	var v interface{}
 	if err := sonic.Unmarshal(data, &v); err == nil {
